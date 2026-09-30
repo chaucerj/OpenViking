@@ -144,6 +144,7 @@ runHookStage({
     sessionId: recallSessionId || "", runCompressor,
     excludeUris: cfg.recallExcludeUris,
     localCompressorAvailable: Boolean(runCompressor),
+    excludeUris: cfg.recallExcludeUris,
     digestCachePath: RECALL_DIGEST_CACHE_PATH, log,
   });
   log("recall_complete", { stage: recalled.stage, chars: recalled.block.length });
