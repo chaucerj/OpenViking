@@ -9,6 +9,8 @@ to the storage system.
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
 from openviking.core.context import ContextLevel
 from openviking.message import Message
 from openviking.message.part import TextPart
+from openviking.pyagfs.exceptions import AGFSConnectionError, AGFSIoError, AGFSTimeoutError
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import (
     MemoryFile,
@@ -217,6 +220,8 @@ class ExtractContext:
         chunk_meta: Optional[Dict[int, ChunkMeta]] = None,
         *,
         split_long_text_messages: bool = True,
+        source_archive_uri: str = "",
+        extraction_scope: str = "",
     ):
         if chunk_meta is None:
             if split_long_text_messages:
@@ -227,6 +232,8 @@ class ExtractContext:
             self.messages = messages
             self.chunk_meta = chunk_meta
         self.page_id_map = PageIdMap()
+        self.source_archive_uri = (source_archive_uri or "").rstrip("/")
+        self.extraction_scope = extraction_scope
 
     @classmethod
     def _build_extraction_messages(
@@ -404,6 +411,20 @@ class ExtractContext:
                 except (ValueError, TypeError):
                     continue
         return datetime.now().strftime("%Y%m%d%H%M%S")
+
+    def get_source_archive_suffix(self) -> str:
+        """Namespace filenames by archive and optional extraction input scope.
+
+        Preserve the existing suffix when no scope is supplied. Different scopes
+        can hold distinct analyses of the same archive, while retries stay stable.
+        """
+        if not self.source_archive_uri and not self.extraction_scope:
+            return ""
+        digest = hashlib.sha256(self.source_archive_uri.encode("utf-8"))
+        if self.extraction_scope:
+            digest.update(b"\0")
+            digest.update(self.extraction_scope.encode("utf-8"))
+        return f"_{digest.hexdigest()[:16]}"
 
     def get_event_content(
         self, ranges_str: str, summary: str | None, ratio_threshold: float = 0.2
@@ -740,6 +761,43 @@ class MemoryUpdateResult:
             f"Edited: {len(self.edited_uris)}, "
             f"Deleted: {len(self.deleted_uris)}, "
             f"Errors: {len(self.errors)}"
+        )
+
+
+class MemoryReadError(Exception):
+    """A fresh upsert read failed before this target could be written."""
+
+    def __init__(self, uri: str, cause: Exception, *, write_started: bool = False):
+        super().__init__(f"Failed to refresh memory {uri}: {cause}")
+        self.retryable = not write_started and (
+            isinstance(
+                cause,
+                (TimeoutError, ConnectionError, AGFSConnectionError, AGFSTimeoutError, AGFSIoError),
+            )
+            or (
+                isinstance(cause, OSError)
+                and cause.errno in {errno.EAGAIN, errno.EBUSY, errno.EINTR, errno.EIO}
+            )
+        )
+
+
+class MemoryUpdateError(Exception):
+    """Report apply failures without treating a partial write as safe to replay."""
+
+    def __init__(self, result: MemoryUpdateResult, *, has_link_updates: bool = False):
+        super().__init__(
+            f"Memory update failed ({result.summary()}): "
+            + "; ".join(f"{uri}: {error}" for uri, error in result.errors)
+        )
+        self.retryable = (
+            bool(result.errors)
+            and not (result.written_uris or result.edited_uris or result.deleted_uris)
+            # Link writes are best-effort and absent from the URI result lists.
+            and not has_link_updates
+            and all(
+                isinstance(error, MemoryReadError) and error.retryable
+                for _uri, error in result.errors
+            )
         )
 
 
@@ -1364,6 +1422,7 @@ class MemoryUpdater:
 
         memory_type = resolved_op.memory_type
         schema = self._registry.get(memory_type)
+        write_started = False
         # Process each URI independently
         for uri in resolved_op.uris:
             source_content = resolved_op.old_memory_file_content
@@ -1387,12 +1446,10 @@ class MemoryUpdater:
             except (NotFoundError, FileNotFoundError):
                 # File doesn't exist yet, that's okay
                 pass
-            except Exception:
-                if is_uri_migration:
-                    raise
-                # Preserve the legacy in-place update fallback to the prefetched
-                # snapshot when a fresh disk read is unavailable.
-                pass
+            except Exception as exc:
+                # Preserve the read stage so callers can regenerate from fresh
+                # inputs, but never replay an operation that already wrote a URI.
+                raise MemoryReadError(uri, exc, write_started=write_started) from exc
             if is_uri_migration:
                 try:
                     source_raw = await viking_fs.read_file(source_content.uri, ctx=ctx)
@@ -1516,6 +1573,7 @@ class MemoryUpdater:
                 ),
                 extract_context=extract_context,
             )
+            write_started = True
             await viking_fs.write_file(
                 uri,
                 new_full_content,

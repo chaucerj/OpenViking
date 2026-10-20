@@ -30,6 +30,11 @@ from openviking.core.namespace import is_content_root_uri
 from openviking.observability.http_error_context import sanitize_public_http_error
 from openviking.parse.backend import ParserBackend, normalize_parser_backend
 from openviking.parse.mode import ParseMode, normalize_parse_mode
+from openviking.parse.network import (
+    ParserNetworkContext,
+    ParserNetworkOperation,
+    overlay_parser_subprocess_env,
+)
 from openviking.parse.parsers.constants import MPEG_TS_EXTENSION_ALIAS
 from openviking.resource.feishu_watch_auth import (
     FEISHU_ACCESS_TOKEN_ARG,
@@ -695,6 +700,7 @@ class ResourceService:
     ) -> Any:
         """Persist a job and fully own the passed lock until handoff or release completes."""
         from openviking.service.task_tracker import get_task_tracker
+        from openviking.service.task_work_index import bind_task_context
         from openviking.storage.queuefs import get_queue_manager
 
         tracker = get_task_tracker()
@@ -712,7 +718,10 @@ class ResourceService:
                 ),
                 auth=task_auth,
             )
-            await get_queue_manager().enqueue(queue_name, msg.to_dict())
+            task_account_id = getattr(task, "account_id", msg.account_id)
+            task_user_id = getattr(task, "user_id", msg.user_id)
+            with bind_task_context(task.task_id, task_account_id, task_user_id):
+                await get_queue_manager().enqueue(queue_name, msg.to_dict())
             enqueued = True
             if on_enqueued is not None:
                 on_enqueued()
@@ -1484,6 +1493,10 @@ class ResourceService:
         proc = None
         try:
             env = build_git_http_auth_env(auth_config, source) if auth_config is not None else None
+            env = overlay_parser_subprocess_env(
+                ParserNetworkContext(ParserNetworkOperation.GIT_COMMAND, source),
+                env,
+            )
             proc = await asyncio.create_subprocess_exec(
                 "git",
                 "ls-remote",
@@ -2459,9 +2472,18 @@ class ResourceService:
             await task_tracker.start(
                 task.task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
             )
-            task_tracker.register_running_task(task.task_id)
+            running_work_id = await task_tracker.register_running_task(
+                task.task_id,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+            )
             try:
-                with bind_task_context(task.task_id, ctx.account_id, ctx.user.user_id):
+                with bind_task_context(
+                    task.task_id,
+                    ctx.account_id,
+                    ctx.user.user_id,
+                    work_id=running_work_id,
+                ):
                     if isinstance(data, SkillProcessingPreparation):
                         result = await self._skill_processor.process_prepared_skill(
                             data,
@@ -2539,7 +2561,11 @@ class ResourceService:
                     "queue.wait.duration_ms",
                     round((time.perf_counter() - wait_start) * 1000, 3),
                 )
-                status = task_tracker.build_queue_status(task.task_id)
+                status = await task_tracker.build_queue_status(
+                    task.task_id,
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                )
                 result["queue_status"] = status
                 self._raise_queue_status_errors(status)
                 # Cancellation settles queue entries without counting errors.
@@ -2578,7 +2604,11 @@ class ResourceService:
             return  # Synchronous preparation failed before the task was created.
         # This includes queued work that must be discarded and active handlers
         # that must finish their cancellation/write cleanup, not just task status.
-        while tracker.has_work(task_id):
+        while await tracker.has_work(
+            task_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+        ):
             await asyncio.sleep(0.05)
 
     async def build_index(
