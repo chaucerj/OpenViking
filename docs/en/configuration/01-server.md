@@ -222,7 +222,7 @@ instruction; non-deletion deactivation requests use `PAUSE`.
 
 Rules live directly in `memories/rules/<scenario_id>/`: `abstract.md` stores Scenario
 metadata and `<atomic_id>.md` stores each Rule. See
-[Rule Scenarios](../concepts/17-rule-scenarios.md) for the storage format.
+[Rules (Beta)](../concepts/17-rule-scenarios.md) for the storage format.
 
 When `jev_rule_matcher` is unconfigured, unavailable, fails, or returns invalid
 results, Scenario and Rule judgments pass the candidates without calling a VLM.
@@ -246,7 +246,7 @@ discard source restrictions. Empty does not mean unknown or inapplicable.
 | `provider` | `vikingdb`, `cohere`, `openai`, `litellm`, `jev` / `null` | `null` | Rerank service; inferred from credentials when omitted |
 | `model` | string / `null` | `null` | OpenAI-compatible, LiteLLM, or Jev rerank model |
 | `mode` | `noul`, `choice`, or `null` | `noul` | Jev rerank mode; `null` also uses `noul` |
-| `threshold` | number | `0.1` | Minimum score considered relevant |
+| `threshold` | number | `0.1` | Minimum rerank score considered relevant; filters only model rerank scores, never vector scores, and a request `score_threshold` overrides it |
 | `max_input_tokens` | integer; `0` or `>= 128` | `0` | Maximum estimated tokens per query-document pair; `0` disables truncation |
 | `log_payloads` | boolean | `false` | Log complete rerank request and response payloads; may expose query and document content |
 
@@ -259,7 +259,8 @@ Rerank has no separate `enabled` field. It becomes available when the required p
 ```json
 {
   "retrieval": {
-    "enable_intent": true
+    "enable_intent": true,
+    "apply_rerank_to_context": false
   }
 }
 ```
@@ -269,8 +270,9 @@ Rerank has no separate `enabled` field. It becomes available when the required p
 | Field | Type / values | Default | Purpose |
 |---|---|---|---|
 | `enable_intent` | boolean | `true` | Run intent analysis/query planning when `session_id` is present |
+| `apply_rerank_to_context` | boolean | `false` | Rerank `search(mode="context")` candidates with the configured `rerank` model |
 
-Search and Find requests default to `limit: 10`; override the limit on each API or SDK request. `retrieval.enable_intent` controls LLM query planning for session-aware Search, while result reranking is enabled only when `rerank` has a usable provider configuration.
+Search and Find requests default to `limit: 10`; override the limit on each API or SDK request. `retrieval.enable_intent` controls LLM query planning for session-aware Search, while result reranking is enabled only when `rerank` has a usable provider configuration. Context mode recalls with Find's vector scores; with `retrieval.apply_rerank_to_context` and a usable `rerank`, it also reranks its merged candidates once against the original query and its expansions before quotas and the token budget apply, which adds one rerank call per request.
 
 ## Storage Settings
 
@@ -301,11 +303,64 @@ Search and Find requests default to `limit: 10`; override the limit on each API 
 |---|---|---|---|
 | `workspace` | path | `"./data"` | OpenViking workspace |
 | `agfs.backend` | `local`, `memory`, `s3` | `local` | File and metadata backend |
+| `agfs.pathlock.provider` | `filesystem`, `memory`, `sqlite`, `cache` | `filesystem` | Path lock storage |
+| `agfs.pathlock.sqlite_path` | absolute local file path | `{workspace}/_system/pathlock/pathlock.db` for `sqlite` | Shared SQLite lock database; optional override |
 | `vectordb.backend` | `local`, `cuvs`, `http`, `volcengine`, `vikingdb` | `local` | Vector database backend |
 | `vectordb.dimension` | integer | follows Embedding | Vector collection dimension |
 | `parse_output.mode` | `agfs`, `local` | `agfs` | Backend for intermediate parser artifacts |
 | `parse_output.local_root` | path or `null` | system temp directory | Root directory used by local parser artifacts |
 | `skip_process_lock` | boolean | `false` | Skip the workspace process lock; use only when accepting concurrent-write risk |
+
+For same-machine path locking on a local disk without recursive business-directory scans, set
+`storage.agfs.pathlock` to `{"provider":"sqlite"}`. The database defaults to
+`{storage.workspace}/_system/pathlock/pathlock.db`, resolved to an absolute path
+from the final workspace when initializing the runtime binding. An explicit absolute
+`sqlite_path` takes precedence. The database parent directory is created automatically.
+Omitting `sqlite_path` or setting it to `null` also uses this default when constructing
+`RAGFSBindingClient(config_path=..., config={"service_name": ...})` directly.
+Every participating process must access the same actual local database file,
+with the same top-level `service_name` and lock expiry setting. Containers on the
+same host must share that local file; identical paths in separate container
+filesystems refer to independent databases and do not coordinate locks.
+SQLite stores authoritative lock tokens and atomically checks Exact/Tree conflicts
+using its path index. Blocking database work runs off the async executor.
+SQLite waits up to 100 ms per attempt for transient database writer contention,
+including when the logical lock wait timeout is zero. The provider retries only
+Busy, with three total attempts and 1 ms / 4 ms backoff. Database waits can total
+about 300 ms, plus 5 ms backoff and execution/scheduling overhead. Exhausted
+retries still report Busy to the manager; logical lock Conflict is not retried. WAL uses
+`synchronous=FULL` to preserve committed lock tokens after a crash, at the cost of
+additional synchronization I/O compared with `NORMAL`.
+Lease heartbeats refresh owned paths in one SQLite transaction (bounded batches
+for large leases). `stale_locks_removed` includes tokens recovered by committed
+atomic SQLite/Redis acquisitions; failed transactions do not increment the count.
+
+SQLite acquisitions completely delete expired tokens belonging to other owners
+that conflict with the request: the target path, ancestor Tree locks, and all
+descendants of a requested Tree lock. Cleanup and acquisition share one transaction,
+so a previous owner cannot revive these tokens by refreshing them after takeover.
+Opportunistic global cleanup is limited to 256 tokens per acquisition; conflicting
+cleanup can exceed that limit and costs more for large expired subtrees.
+
+Do not place the database on EFS, NFS, or SMB. SQLite WAL requires participants
+on the same machine and is not supported on network filesystems; frequent lock
+updates also add synchronization I/O. If `storage.workspace` is on EFS, the
+default database path is on EFS too. Moving it to each container's local disk
+creates independent lock authorities and cannot coordinate replicas.
+
+For multiple containers or hosts sharing EFS, use shared Redis PathLock:
+set `storage.agfs.pathlock.provider="cache"` and top-level `cache.provider="redis"`.
+All replicas must use the same Redis deployment, top-level `service_name`, and
+lock expiry setting. See the [shared Redis configuration example](../guides/01-configuration.md).
+Shared QueueFS must also use a backend suitable for that deployment, such as
+`storage.agfs.queuefs.backend="cache"`; changing PathLock alone does not change
+the default SQLite queue backend.
+
+Stop all participating processes before switching providers:
+SQLite and filesystem lock files do not share a protocol. Do not delete the database,
+WAL, or SHM files while participants are running. Crashed owners' tokens become
+eligible for takeover after `lock_expire_secs` (default 30 seconds). This setting
+does not change the workspace process lock or other backend concurrency constraints.
 
 Remote backends also require endpoint, bucket/collection, credentials, and timeout fields. See [Configuration](../guides/01-configuration.md#storage) for complete examples.
 
